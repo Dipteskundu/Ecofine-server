@@ -22,7 +22,7 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    await client.connect();
+    // await client.connect();
     const db = client.db(process.env.DB_NAME);
     const modelCollection = db.collection('issues');
 
@@ -31,6 +31,7 @@ async function run() {
       res.send(result);
     });
 
+// this part of server is building up not completed 
     app.post('/issues', async(req, res) => {
       const data = req.body
       console.log(data);
@@ -47,7 +48,7 @@ async function run() {
 
 
 
-    await client.db('admin').command({ ping: 1 });
+    // await client.db('admin').command({ ping: 1 });
     console.log('✅ Connected to MongoDB successfully!');
   } finally {
     // await client.close();
