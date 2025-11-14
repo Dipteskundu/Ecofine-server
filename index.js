@@ -10,18 +10,16 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ---------------------------
 // FIREBASE ADMIN INITIALIZE
-// ---------------------------
+
 const serviceAccount = require("./serviceAccountKey.json");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// ---------------------------
 // TOKEN MIDDLEWARE
-// ---------------------------
+
 const verifyToken = async (req, res, next) => {
   const authorization = req.headers.authorization;
 
@@ -30,22 +28,21 @@ const verifyToken = async (req, res, next) => {
   }
 
   const token = authorization.split(" ")[1];
-  console.log("📌 Token received:", token);
+  console.log(" Token received:", token);
 
   try {
     const decoded = await admin.auth().verifyIdToken(token);
-    console.log("✅ Token verified user:", decoded.email);
+    console.log(" Token verified user:", decoded.email);
     req.user = decoded; // save decoded user details
     next();
   } catch (error) {
-    console.log("❌ Token invalid:", error);
+    console.log("Token invalid:", error);
     return res.status(401).send({ success: false, message: "Unauthorized: Invalid token" });
   }
 };
 
-// ---------------------------
 // DATABASE CONNECTION
-// ---------------------------
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@${process.env.DB_CLUSTER}.mongodb.net/${process.env.DB_NAME}?retryWrites=true&w=majority`;
 
 const client = new MongoClient(uri, {
@@ -63,13 +60,11 @@ async function run() {
     const issuesCollection = db.collection('issues');
     const contributionsCollection = db.collection('my-contribution');
 
-    console.log("✅ MongoDB Connected!");
+    console.log("MongoDB Connected!");
 
-    // ---------------------------
+
     // ISSUES ROUTES
-    // ---------------------------
 
-    // Get all issues with optional filtering
     app.get('/issues', async (req, res) => {
       const query = {};
       if (req.query.category) query.category = req.query.category;
@@ -146,9 +141,8 @@ async function run() {
       res.send({ success: true, message: "Issue deleted successfully", result });
     });
 
-    // ---------------------------
+
     // CONTRIBUTIONS ROUTES
-    // ---------------------------
 
     // Add new contribution
     app.post('/my-contribution', verifyToken, async (req, res) => {
@@ -192,17 +186,14 @@ async function run() {
     });
 
   } catch (err) {
-    console.error("❌ MongoDB Connection Error:", err);
+    console.error("MongoDB Connection Error:", err);
   }
 }
 
 run().catch(console.dir);
-
-// ---------------------------
-// BASE ROUTE
-// ---------------------------
+-
 app.get('/', (req, res) => {
-  res.send("EcoFine Backend Running with Token Auth");
+  res.send("EcoFine Backend Running");
 });
 
 app.listen(port, () => {
