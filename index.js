@@ -1,26 +1,22 @@
-const express = require('express'); 
+const express = require('express');
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const admin = require("firebase-admin");
 require('dotenv').config();
+const admin = require("./firebase");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = Number(process.env.PORT) || 3000;
 
 app.use(cors());
 app.use(express.json());
 
-// FIREBASE ADMIN INITIALIZE
-
-const serviceAccount = require("./serviceAccountKey.json");
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
 // TOKEN MIDDLEWARE
 
 const verifyToken = async (req, res, next) => {
+  if (!admin) {
+    return res.status(500).send({ success: false, message: "Authentication service not configured" });
+  }
+
   const authorization = req.headers.authorization;
 
   if (!authorization || !authorization.startsWith("Bearer ")) {
@@ -55,23 +51,93 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
+    await client.connect();
     const db = client.db(process.env.DB_NAME);
 
     const issuesCollection = db.collection('issues');
     const contributionsCollection = db.collection('my-contribution');
+    const usersCollection = db.collection('users');
 
     console.log("MongoDB Connected!");
+
+    // USERS & ROLE ROUTES
+
+    // Save or update user
+    app.post('/users', async (req, res) => {
+      const user = req.body;
+      const query = { email: user.email };
+      const updateDoc = {
+        $set: {
+          name: user.name,
+          email: user.email,
+          photo: user.photo,
+          lastLogin: new Date()
+        },
+        $setOnInsert: {
+          role: user.email === 'admin@eco.com' ? 'admin' : 'user',
+          createdAt: new Date()
+        }
+      };
+
+      const result = await usersCollection.updateOne(query, updateDoc, { upsert: true });
+      res.send(result);
+    });
+
+    // Check if user is admin
+    app.get('/users/admin/:email', verifyToken, async (req, res) => {
+      const email = req.params.email;
+
+      if (email !== req.user.email) {
+        return res.status(403).send({ message: 'Forbidden access' });
+      }
+
+      const user = await usersCollection.findOne({ email });
+      let admin = false;
+      if (user) {
+        admin = user?.role === 'admin';
+      }
+      res.send({ admin });
+    });
 
 
     // ISSUES ROUTES
 
     app.get('/issues', async (req, res) => {
-      const query = {};
-      if (req.query.category) query.category = req.query.category;
-      if (req.query.status) query.status = req.query.status;
+      try {
+        const { search, category, status, sort, page = 1, limit = 8 } = req.query;
+        const query = {};
 
-      const result = await issuesCollection.find(query).toArray();
-      res.send(result);
+        if (category) query.category = category;
+        if (status) query.status = status;
+        if (search) {
+          query.$or = [
+            { title: { $regex: search, $options: 'i' } },
+            { description: { $regex: search, $options: 'i' } },
+            { location: { $regex: search, $options: 'i' } }
+          ];
+        }
+
+        let sortQuery = { date: -1 }; // Default: Newest first
+        if (sort === 'date_asc') sortQuery = { date: 1 };
+        if (sort === 'title_asc') sortQuery = { title: 1 };
+        if (sort === 'title_desc') sortQuery = { title: -1 };
+        if (sort === 'amount_asc') sortQuery = { amount: 1 };
+        if (sort === 'amount_desc') sortQuery = { amount: -1 };
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const totalCount = await issuesCollection.countDocuments(query);
+        const result = await issuesCollection.find(query)
+          .sort(sortQuery)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        res.send({ result, totalCount, page: parseInt(page), limit: parseInt(limit) });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Error fetching issues" });
+      }
     });
 
     // Get recent 6 issues
@@ -191,11 +257,34 @@ async function run() {
 }
 
 run().catch(console.dir);
--
+
 app.get('/', (req, res) => {
   res.send("EcoFine Backend Running");
 });
 
-app.listen(port, () => {
-  console.log(`🚀 Server running at http://localhost:${port}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  const startServer = (currentPort, attempts = 0) => {
+    if (attempts > 5) {
+      console.error(`Failed to start server after multiple attempts`);
+      return;
+    }
+
+    const server = app.listen(currentPort, () => {
+      console.log(`🚀 Server running at http://localhost:${currentPort}`);
+    });
+
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        const nextPort = currentPort + 1;
+        console.error(`Port ${currentPort} is in use, trying port ${nextPort}`);
+        startServer(nextPort, attempts + 1);
+      } else {
+        console.error('Server error:', error);
+      }
+    });
+  };
+
+  startServer(port);
+}
+
+module.exports = app;
