@@ -1,9 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const { ObjectId } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
 const admin = require("./firebase");
-const { connectToDatabase } = require('./db');
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -44,240 +43,232 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-// COLLECTIONS (initialized globally but populated via connection)
-let db, issuesCollection, contributionsCollection, usersCollection;
+// DATABASE CONNECTION
 
-// DB CONNECTION MANGEMENT MIDDLEWARE
-// This ensures that for every request (including keep-alive), we have a valid DB connection
-const ensureDbConnection = async (req, res, next) => {
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@${process.env.DB_CLUSTER}.mongodb.net/${process.env.DB_NAME}?retryWrites=true&w=majority`;
+
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
+async function run() {
   try {
-    if (!db || !issuesCollection || !usersCollection) {
-      const { db: connectedDb } = await connectToDatabase();
-      db = connectedDb;
-      issuesCollection = db.collection('issues');
-      contributionsCollection = db.collection('my-contribution');
-      usersCollection = db.collection('users');
-    }
-    next();
+    await client.connect();
+    const db = client.db(process.env.DB_NAME);
+
+    const issuesCollection = db.collection('issues');
+    const contributionsCollection = db.collection('my-contribution');
+    const usersCollection = db.collection('users');
+
+    console.log("MongoDB Connected!");
+
+    // USERS & ROLE ROUTES
+
+    // Save or update user
+    app.post('/users', async (req, res) => {
+      const user = req.body;
+      const query = { email: user.email };
+      const updateDoc = {
+        $set: {
+          name: user.name,
+          email: user.email,
+          photo: user.photo,
+          lastLogin: new Date()
+        },
+        $setOnInsert: {
+          role: user.email === 'admin@eco.com' ? 'admin' : 'user',
+          createdAt: new Date()
+        }
+      };
+
+      const result = await usersCollection.updateOne(query, updateDoc, { upsert: true });
+      res.send(result);
+    });
+
+    // Check if user is admin
+    app.get('/users/admin/:email', verifyToken, async (req, res) => {
+      const email = req.params.email;
+
+      if (email !== req.user.email) {
+        return res.status(403).send({ message: 'Forbidden access' });
+      }
+
+      const user = await usersCollection.findOne({ email });
+      let admin = false;
+      if (user) {
+        admin = user?.role === 'admin';
+      }
+      res.send({ admin });
+    });
+
+
+    // ISSUES ROUTES
+
+    app.get('/issues', async (req, res) => {
+      try {
+        const { search, category, status, sort, page = 1, limit = 8 } = req.query;
+        const query = {};
+
+        if (category) query.category = category;
+        if (status) query.status = status;
+        if (search) {
+          query.$or = [
+            { title: { $regex: search, $options: 'i' } },
+            { description: { $regex: search, $options: 'i' } },
+            { location: { $regex: search, $options: 'i' } }
+          ];
+        }
+
+        let sortQuery = { date: -1 }; // Default: Newest first
+        if (sort === 'date_asc') sortQuery = { date: 1 };
+        if (sort === 'title_asc') sortQuery = { title: 1 };
+        if (sort === 'title_desc') sortQuery = { title: -1 };
+        if (sort === 'amount_asc') sortQuery = { amount: 1 };
+        if (sort === 'amount_desc') sortQuery = { amount: -1 };
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const totalCount = await issuesCollection.countDocuments(query);
+        const result = await issuesCollection.find(query)
+          .sort(sortQuery)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        res.send({ result, totalCount, page: parseInt(page), limit: parseInt(limit) });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Error fetching issues" });
+      }
+    });
+
+    // Get recent 6 issues
+    app.get('/issues/recent', async (req, res) => {
+      const recent = await issuesCollection.find().sort({ date: -1 }).limit(6).toArray();
+      res.send(recent);
+    });
+
+    // Add a new issue
+    app.post('/issues', verifyToken, async (req, res) => {
+      const data = req.body;
+      data.email = req.user.email; // secure email
+      data.date = new Date();
+      const result = await issuesCollection.insertOne(data);
+      res.send({ success: true, result });
+    });
+
+    // Get single issue by ID (use only /issues/:id)
+    app.get('/issues/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const objectId = new ObjectId(id);
+        const result = await issuesCollection.findOne({ _id: objectId });
+        if (!result) return res.status(404).send({ success: false, message: "Issue not found" });
+        res.send({ success: true, result });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Error fetching issue" });
+      }
+    });
+
+    // Get issues reported by a specific user
+    app.get('/my-issues/:email', verifyToken, async (req, res) => {
+      const emailParam = req.params.email;
+      if (req.user.email !== emailParam) {
+        return res.status(403).send({ success: false, message: "Forbidden: Email mismatch" });
+      }
+      const result = await issuesCollection.find({ email: emailParam }).toArray();
+      res.send(result);
+    });
+
+    // Update issue by ID (owner only)
+    app.put('/issues/:id', verifyToken, async (req, res) => {
+      const { id } = req.params;
+      const updateFields = req.body;
+
+      const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+      if (!issue) return res.status(404).send({ success: false, message: "Issue not found" });
+      if (issue.email !== req.user.email) return res.status(403).send({ success: false, message: "Forbidden: Not the owner" });
+
+      const result = await issuesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updateFields }
+      );
+
+      res.send({ success: true, result });
+    });
+
+    // Delete issue by ID (owner only)
+    app.delete('/issues/:id', verifyToken, async (req, res) => {
+      const { id } = req.params;
+      const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+      if (!issue) return res.status(404).send({ success: false, message: "Issue not found" });
+      if (issue.email !== req.user.email) return res.status(403).send({ success: false, message: "Forbidden: Not the owner" });
+
+      const result = await issuesCollection.deleteOne({ _id: new ObjectId(id) });
+      res.send({ success: true, message: "Issue deleted successfully", result });
+    });
+
+
+    // CONTRIBUTIONS ROUTES
+
+    // Add new contribution
+    app.post('/my-contribution', verifyToken, async (req, res) => {
+      try {
+        const data = req.body;
+        data.email = req.user.email; // secure email
+        data.date = new Date();
+
+        const result = await contributionsCollection.insertOne(data);
+        res.send({ success: true, result });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Failed to save contribution" });
+      }
+    });
+
+    // Get contributions of logged-in user
+    app.get('/my-contribution', verifyToken, async (req, res) => {
+      try {
+        const email = req.user.email;
+        const result = await contributionsCollection.find({ email }).toArray();
+        res.send({ success: true, result });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Failed to fetch contributions" });
+      }
+    });
+
+    // Get single contribution by ID (use only /my-contribution/:id)
+    app.get('/my-contribution/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const objectId = new ObjectId(id);
+        const result = await contributionsCollection.findOne({ _id: objectId });
+        if (!result) return res.status(404).send({ success: false, message: "Contribution not found" });
+        res.send({ success: true, result });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Failed to fetch contribution" });
+      }
+    });
+
   } catch (err) {
-    console.error("Failed to connect to DB in middleware:", err);
-    res.status(500).send({ success: false, message: "Database Connection Failed" });
+    console.error("MongoDB Connection Error:", err);
   }
-};
+}
 
-// Apply DB connection check to all API routes
-app.use(ensureDbConnection);
-
-// KEEP ALIVE ENDPOINT (For Vercel Cron)
-app.get('/api/keep-alive', async (req, res) => {
-  // ensureDbConnection has already run, so if we are here, DB is connected.
-  res.status(200).json({
-    status: "alive",
-    timestamp: new Date().toISOString(),
-    message: "Server is warm and DB is connected"
-  });
-});
-
-// USERS & ROLE ROUTES
-app.post('/users', async (req, res) => {
-  const user = req.body;
-  const query = { email: user.email };
-  const updateDoc = {
-    $set: {
-      name: user.name,
-      email: user.email,
-      photo: user.photo,
-      lastLogin: new Date()
-    },
-    $setOnInsert: {
-      role: user.email === 'admin@eco.com' ? 'admin' : 'user',
-      createdAt: new Date()
-    }
-  };
-
-  const result = await usersCollection.updateOne(query, updateDoc, { upsert: true });
-  res.send(result);
-});
-
-// Check if user is admin
-app.get('/users/admin/:email', verifyToken, async (req, res) => {
-  const email = req.params.email;
-
-  if (email !== req.user.email) {
-    return res.status(403).send({ message: 'Forbidden access' });
-  }
-
-  const user = await usersCollection.findOne({ email });
-  let admin = false;
-  if (user) {
-    admin = user?.role === 'admin';
-  }
-  res.send({ admin });
-});
-
-
-// ISSUES ROUTES
-app.get('/issues', async (req, res) => {
-  try {
-    const { search, category, status, sort, page = 1, limit = 8 } = req.query;
-    const query = {};
-
-    if (category) query.category = category;
-    if (status) query.status = status;
-    if (search) {
-      query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { location: { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    let sortQuery = { date: -1 };
-    if (sort === 'date_asc') sortQuery = { date: 1 };
-    if (sort === 'title_asc') sortQuery = { title: 1 };
-    if (sort === 'title_desc') sortQuery = { title: -1 };
-    if (sort === 'amount_asc') sortQuery = { amount: 1 };
-    if (sort === 'amount_desc') sortQuery = { amount: -1 };
-
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    const totalCount = await issuesCollection.countDocuments(query);
-    const result = await issuesCollection.find(query)
-      .sort(sortQuery)
-      .skip(skip)
-      .limit(parseInt(limit))
-      .toArray();
-
-    res.send({ result, totalCount, page: parseInt(page), limit: parseInt(limit) });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ success: false, message: "Error fetching issues" });
-  }
-});
-
-app.get('/issues/recent', async (req, res) => {
-  try {
-    const recent = await issuesCollection.find().sort({ date: -1 }).limit(6).toArray();
-    res.send(recent);
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Error fetching recent issues" });
-  }
-});
-
-app.post('/issues', verifyToken, async (req, res) => {
-  const data = req.body;
-  data.email = req.user.email;
-  data.date = new Date();
-  const result = await issuesCollection.insertOne(data);
-  res.send({ success: true, result });
-});
-
-app.get('/issues/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const objectId = new ObjectId(id);
-    const result = await issuesCollection.findOne({ _id: objectId });
-    if (!result) return res.status(404).send({ success: false, message: "Issue not found" });
-    res.send({ success: true, result });
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Error fetching issue" });
-  }
-});
-
-app.get('/my-issues/:email', verifyToken, async (req, res) => {
-  const emailParam = req.params.email;
-  if (req.user.email !== emailParam) {
-    return res.status(403).send({ success: false, message: "Forbidden: Email mismatch" });
-  }
-  const result = await issuesCollection.find({ email: emailParam }).toArray();
-  res.send(result);
-});
-
-app.put('/issues/:id', verifyToken, async (req, res) => {
-  const { id } = req.params;
-  const updateFields = req.body;
-  const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-  if (!issue) return res.status(404).send({ success: false, message: "Issue not found" });
-  if (issue.email !== req.user.email) return res.status(403).send({ success: false, message: "Forbidden" });
-  const result = await issuesCollection.updateOne({ _id: new ObjectId(id) }, { $set: updateFields });
-  res.send({ success: true, result });
-});
-
-app.delete('/issues/:id', verifyToken, async (req, res) => {
-  const { id } = req.params;
-  const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-  if (!issue) return res.status(404).send({ success: false, message: "Issue not found" });
-  if (issue.email !== req.user.email) return res.status(403).send({ success: false, message: "Forbidden" });
-  const result = await issuesCollection.deleteOne({ _id: new ObjectId(id) });
-  res.send({ success: true, result });
-});
-
-// CONTRIBUTIONS ROUTES
-app.post('/my-contribution', verifyToken, async (req, res) => {
-  try {
-    const data = req.body;
-    data.email = req.user.email;
-    data.date = new Date();
-    const result = await contributionsCollection.insertOne(data);
-    res.send({ success: true, result });
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Failed" });
-  }
-});
-
-app.get('/my-contribution', verifyToken, async (req, res) => {
-  try {
-    const email = req.user.email;
-    const result = await contributionsCollection.find({ email }).toArray();
-    res.send({ success: true, result });
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Failed" });
-  }
-});
-
-app.get('/my-contribution/:id', verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await contributionsCollection.findOne({ _id: new ObjectId(id) });
-    res.send({ success: true, result });
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Failed" });
-  }
-});
-
-// FAVORITES ROUTES
-app.get('/users/favorites/:email', verifyToken, async (req, res) => {
-  try {
-    const email = req.params.email;
-    if (req.user.email !== email) return res.status(403).send({ message: "Forbidden" });
-    const user = await usersCollection.findOne({ email });
-    res.send({ success: true, favorites: user?.favorites || [] });
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Failed" });
-  }
-});
-
-app.post('/users/favorites', verifyToken, async (req, res) => {
-  try {
-    const { issueId } = req.body;
-    const email = req.user.email;
-    const user = await usersCollection.findOne({ email });
-    if (!user) return res.status(404).send({ message: "User not found" });
-    const favorites = user.favorites || [];
-    const isFavorited = favorites.includes(issueId);
-    const updateDoc = isFavorited ? { $pull: { favorites: issueId } } : { $addToSet: { favorites: issueId } };
-    await usersCollection.updateOne({ email }, updateDoc);
-    res.send({ success: true, isLiked: !isFavorited });
-  } catch (err) {
-    res.status(500).send({ success: false, message: "Failed" });
-  }
-});
+run().catch(console.dir);
 
 app.get('/', (req, res) => {
   res.send("EcoFine Backend Running");
 });
 
-if (require.main === module) {
+if (process.env.NODE_ENV !== 'production') {
   const startServer = (currentPort, attempts = 0) => {
     if (attempts > 5) {
       console.error(`Failed to start server after multiple attempts`);
